@@ -10,3 +10,4 @@ test/calib.mjs
 test/run.sh
 test/segbench.mjs
 test/gpuprobe.mjs
+test/playtest.mjs

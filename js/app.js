@@ -137,18 +137,34 @@ $("#allOff").onclick = () => { const f = $("#filter").value; S.cuts.forEach(c =>
 
 // ---------------------------------------------------------------- player: preview the cut result without encoding
 const video = $("#video");
-for (const b of $$("#mode button")) b.onclick = () => { S.mode = b.dataset.m; $$("#mode button").forEach(x => x.classList.toggle("on", x === b)); };
+for (const b of $$("#mode button")) b.onclick = () => { S.mode = b.dataset.m; endGlide(); $$("#mode button").forEach(x => x.classList.toggle("on", x === b)); };
 const findRemoved = t => { let lo = 0, hi = S.removed.length - 1; while (lo <= hi) { const m = (lo + hi) >> 1, [a, b] = S.removed[m]; if (t < a) hi = m - 1; else if (t >= b) lo = m + 1; else return m; } return -lo - 1; };
-let stopAt = null;
+let stopAt = null, userRate = 1, skipping = false;
+video.addEventListener("ratechange", () => { if (!skipping) userRate = video.playbackRate; });
+// Skipping a cut by seeking is slow when the source has few keyframes (screen recordings: one per 30 s, and every
+// seek decodes from the last one). So short cuts are fast-forwarded instead: muted, at up to 16x, easing down near
+// the end so speech is not clipped; only long gaps (> 8 s) are jumped with a seek.
+function glide(target) {     // fast-forward to `target`; returns true while still gliding
+  const left = target - video.currentTime;
+  if (left > 8) { video.currentTime = target; return false; }
+  if (left <= 0.01) return false;
+  if (!skipping) { skipping = true; video.muted = true; }
+  video.playbackRate = Math.max(1, Math.min(16, left * 12));
+  return true;
+}
+function endGlide() { if (skipping) { skipping = false; video.playbackRate = userRate; video.muted = false; } }
 function tick() {
-  if (!video.paused && S.removed.length) {
-    const t = video.currentTime, i = findRemoved(t + 0.015);
-    if (S.mode === "skip" && i >= 0) video.currentTime = S.removed[i][1] + 0.002;
-    if (S.mode === "cuts") {
-      if (i < 0) { const n = -i - 1; if (n < S.removed.length) video.currentTime = S.removed[n][0]; else video.pause(); }
+  if (!video.paused && S.removed.length && S.mode !== "orig") {
+    const t = video.currentTime, i = findRemoved(t + 0.01);
+    let gliding = false;
+    if (S.mode === "skip" && i >= 0) gliding = glide(S.removed[i][1] + 0.005);
+    if (S.mode === "cuts" && i < 0) {               // only the cuts: glide over the kept parts
+      const n = -i - 1;
+      if (n < S.removed.length) gliding = glide(S.removed[n][0]); else video.pause();
     }
-    if (stopAt != null && t >= stopAt) { video.pause(); stopAt = null; }
-  }
+    if (!gliding) endGlide();
+  } else endGlide();
+  if (stopAt != null && video.currentTime >= stopAt) { video.pause(); stopAt = null; }
   if (S.peaks) drawPlayhead();
   requestAnimationFrame(tick);
 }
