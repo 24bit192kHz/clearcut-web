@@ -135,6 +135,7 @@ kbd{border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;paddi
         <h2>Encode</h2>
         <fieldset><legend>Size (shrinkvid)</legend>
           <label>Codec <select id="codec"></select></label>
+          <p class="hint" id="gpu"></p>
           <label>Quality target <select id="quality"><option value="smart" selected>smart: knee of size vs quality (like shrinkvid)</option><option value="high">high (≈ VMAF 97)</option><option value="balanced">balanced (≈ VMAF 96)</option><option value="small">small (≈ VMAF 94)</option></select></label>
           <label class="chk"><input type="checkbox" id="downscale"> Allow a lower resolution if it is smaller at the same quality</label>
           <p class="hint">Encodes three short samples at several settings, checks each against the original, and picks the smallest that meets the target.</p>

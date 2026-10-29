@@ -8,3 +8,5 @@ test/*.txt
 node_modules/
 test/calib.mjs
 test/run.sh
+test/segbench.mjs
+test/gpuprobe.mjs

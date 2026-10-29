@@ -15,10 +15,10 @@ export const QUALITY = { smart: "smart", high: 0.999, balanced: 0.997, small: 0.
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // first codec string the browser can encode at this size, preferring hardware and quantizer (CQ) rate control
-export async function encoderConfig(kind, width, height, fps) {
+export async function encoderConfig(kind, width, height, fps, onlyMode = null) {
   for (const hw of ["prefer-hardware", "no-preference"]) {
     for (const codec of CODECS[kind].strings) {
-      for (const mode of ["quantizer", "variable"]) {
+      for (const mode of onlyMode ? [onlyMode] : ["quantizer", "variable"]) {
         const cfg = { codec, width, height, framerate: fps, bitrateMode: mode, latencyMode: "quality", hardwareAcceleration: hw,
           ...(mode === "variable" ? { bitrate: Math.round(width * height * fps * 0.08) } : {}), ...(kind === "avc" ? { avc: { format: "avc" } } : {}), ...(kind === "hevc" ? { hevc: { format: "hevc" } } : {}) };
         try { const r = await VideoEncoder.isConfigSupported(cfg); if (r.supported) return { ...r.config, hw: hw === "prefer-hardware", mode }; } catch { }
@@ -48,15 +48,17 @@ async function decoderFor(video, onFrame) {
 }
 const chunkOf = s => new EncodedVideoChunk({ type: s.key ? "key" : "delta", timestamp: Math.round(s.cts * 1e6 / s.ts), duration: Math.round(s.duration * 1e6 / s.ts), data: s.data });
 
-// decode the frames whose timestamps fall in [a, b) seconds (decoding starts at the keyframe before a)
-async function decodeRange(video, a, b) {
-  const S = video.samples, frames = [];
-  let k = S.findIndex(s => s.cts / s.ts >= a); if (k < 0) return frames;
+// stream the frames whose timestamps fall in [a, b) seconds to onFrame (which must close them); decoding starts at
+// the keyframe before a. Nothing is held: a GPU decoder has a small frame pool and 1440p frames are 11 MB each.
+async function decodeRange(video, a, b, onFrame, busy = () => false) {
+  const S = video.samples;
+  let k = S.findIndex(s => s.cts / s.ts >= a); if (k < 0) return 0;
   while (k > 0 && !S[k].key) k--;
-  const dec = await decoderFor(video, f => { const t = f.timestamp / 1e6; if (t >= a && t < b) frames.push(f); else f.close(); });
-  for (let i = k; i < S.length && S[i].dts / S[i].ts < b + 1; i++) { dec.decode(chunkOf(S[i])); if (dec.decodeQueueSize > 16) await sleep(1); }
+  let n = 0;
+  const dec = await decoderFor(video, f => { const t = f.timestamp / 1e6; if (t >= a && t < b) { n++; onFrame(f); } else f.close(); });
+  for (let i = k; i < S.length && S[i].dts / S[i].ts < b + 1; i++) { dec.decode(chunkOf(S[i])); while (dec.decodeQueueSize > 4 || busy()) await sleep(1); }
   await dec.flush(); dec.close();
-  return frames.sort((x, y) => x.timestamp - y.timestamp);
+  return n;
 }
 
 // ---------------------------------------------------------------- SSIM on luma at 480 px width
@@ -65,8 +67,8 @@ function lumaOf(frame, ctxCache) {
   const h = Math.round(AW * frame.displayHeight / frame.displayWidth);
   let c = ctxCache.c; if (!c || c.canvas.height !== h) { ctxCache.c = c = new OffscreenCanvas(AW, h).getContext("2d", { willReadFrequently: true }); }
   c.drawImage(frame, 0, 0, AW, h);
-  const d = c.getImageData(0, 0, AW, h).data, y = new Float32Array(AW * h);
-  for (let i = 0; i < y.length; i++) y[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+  const d = c.getImageData(0, 0, AW, h).data, y = new Uint8Array(AW * h);
+  for (let i = 0; i < y.length; i++) y[i] = (77 * d[4 * i] + 150 * d[4 * i + 1] + 29 * d[4 * i + 2]) >> 8;
   return { y, w: AW, h };
 }
 function ssim(A, B) {
@@ -80,25 +82,33 @@ function ssim(A, B) {
   return s / n;
 }
 
-// encode frames with one setting and decode them back: bytes + per-frame SSIM against refs
-async function trial(frames, refs, cfg, kind, q, scaleH, fps) {
-  const chunks = []; let meta = null;
-  const enc = new VideoEncoder({ output: (c, m) => { chunks.push(c); if (m?.decoderConfig) meta = m.decoderConfig; }, error: e => { throw e; } });
-  const W = scaleH ? Math.round(frames[0].displayWidth * scaleH / frames[0].displayHeight / 2) * 2 : frames[0].displayWidth;
-  const H = scaleH || frames[0].displayHeight;
-  enc.configure({ ...cfg, width: W, height: H });
-  const cv = scaleH ? new OffscreenCanvas(W, H).getContext("2d") : null;
-  frames.forEach((f, i) => {
-    let src = f;
+// encode one window with one setting (frames streamed from the decoder) and decode it back: bytes + per-frame SSIM
+async function trial(video, win, refs, cfg, kind, q, scaleH, fps, warm = 0) {
+  // warm: seconds encoded before the window but not scored (VBR rate control needs a few seconds to settle)
+  const chunks = []; let meta = null, enc = null, cv = null, i = 0, W = 0, H = 0;
+  const w0 = Math.max(0, win[0] - warm), skip = Math.round((win[0] - w0) * fps);
+  const encOut = (c, m) => { chunks.push(c); if (m?.decoderConfig) meta = m.decoderConfig; };
+  await decodeRange(video, w0, win[1], f => {
+    if (!enc) {
+      W = scaleH ? Math.round(f.displayWidth * scaleH / f.displayHeight / 2) * 2 : f.displayWidth; H = scaleH || f.displayHeight;
+      enc = new VideoEncoder({ output: encOut, error: e => console.error("encoder", e) }); enc.configure({ ...cfg, width: W, height: H });
+      if (scaleH) cv = new OffscreenCanvas(W, H).getContext("2d");
+    }
+    let src;
     if (cv) { cv.drawImage(f, 0, 0, W, H); src = new VideoFrame(cv.canvas, { timestamp: Math.round(i * 1e6 / fps) }); }
     else src = new VideoFrame(f, { timestamp: Math.round(i * 1e6 / fps) });
-    enc.encode(src, { keyFrame: i === 0, ...encOpts(kind, cfg.mode === "quantizer" ? q : null) }); src.close();
+    f.close();
+    enc.encode(src, { keyFrame: i === 0, ...encOpts(kind, cfg.mode === "quantizer" ? q : null) }); src.close(); i++;
   });
+  if (!enc) return { bytes: 0, scores: [] };
   await enc.flush(); enc.close();
-  const bytes = chunks.reduce((s, c) => s + c.byteLength, 0), scores = [], cache = {};
-  const dec = new VideoDecoder({ output: f => { const i = Math.round(f.timestamp * fps / 1e6); if (refs[i]) scores.push(ssim(refs[i], lumaOf(f, cache))); f.close(); }, error: e => { throw e; } });
+  // bytes of the scored part, with its keyframe counted at the real rate (one per 10 s GOP)
+  const scored = chunks.filter(c => c.timestamp >= skip * 1e6 / fps), key = chunks[0].byteLength, secs = Math.max(1 / fps, (i - skip) / fps);
+  const bytes = (warm ? scored.reduce((s, c) => s + c.byteLength, 0) : chunks.slice(1).reduce((s, c) => s + c.byteLength, 0) + key * Math.min(1, secs / 10));
+  const scores = [], cache = {};
+  const dec = new VideoDecoder({ output: f => { const j = Math.round(f.timestamp * fps / 1e6) - skip; if (j >= 0 && refs[j]) scores.push(ssim(refs[j], lumaOf(f, cache))); f.close(); }, error: e => console.error("decoder", e) });
   dec.configure(meta);
-  for (const c of chunks) dec.decode(c);
+  for (const c of chunks) { dec.decode(c); while (dec.decodeQueueSize > 4) await sleep(1); }
   await dec.flush(); dec.close();
   return { bytes, scores };
 }
@@ -106,7 +116,7 @@ async function trial(frames, refs, cfg, kind, q, scaleH, fps) {
 // shrinkvid-style search. Returns { q, scaleH, bytesPerSec, mean, p5, table }
 export async function smartSize(video, keep, kind, target, { allowDownscale = false, fps, onProgress } = {}) {
   const W = video.track.video.width, H = video.track.video.height;
-  AW = Math.min(1280, W - (W % 8));   // full-resolution luma: text/whiteboard detail is what degrades first
+  AW = Math.min(960, W - (W % 8));   // full-resolution luma: text/whiteboard detail is what degrades first
   const cfg = await encoderConfig(kind, W, H, fps);
   if (!cfg) throw new Error(`${CODECS[kind].label} encoding is not supported in this browser`);
   // three 2 s windows spread over the kept timeline (shrinkvid: deterministic, evenly spread)
@@ -116,18 +126,18 @@ export async function smartSize(video, keep, kind, target, { allowDownscale = fa
     for (const [a, b] of keep) { if (t <= b - a) { wins.push([a + t, Math.min(b, a + t + 2)]); break; } t -= b - a; }
   }
   const sets = [];
-  for (const [a, b] of wins) {
-    const frames = await decodeRange(video, a, b), cache = {};
-    if (frames.length) sets.push({ frames, refs: frames.map(f => lumaOf(f, cache)), secs: frames.length / fps });
+  for (const win of wins) {
+    const refs = [], cache = {};
+    await decodeRange(video, win[0], win[1], f => { refs.push(lumaOf(f, cache)); f.close(); });
+    if (refs.length) sets.push({ win, refs, secs: refs.length / fps });
   }
   const families = [0, ...(allowDownscale && H > 720 ? [720] : []), ...(allowDownscale && H > 540 ? [Math.round(H * 3 / 5 / 2) * 2] : [])];
   const table = [], ladder = cfg.mode === "quantizer" ? CODECS[kind].ladder : [0.5, 1, 2, 4, 8];
   const measure = async (q, scaleH) => {
     let bytes = 0, secs = 0; const all = [];
-    for (const s of sets) {
-      const c = cfg.mode === "quantizer" ? cfg : { ...cfg, bitrate: Math.round(q * 1e6 * (scaleH ? scaleH / H : 1) ** 2) };
-      const r = await trial(s.frames, s.refs, c, kind, q, scaleH, fps); bytes += r.bytes; secs += s.secs; all.push(...r.scores);
-    }
+    const c = cfg.mode === "quantizer" ? cfg : { ...cfg, bitrate: Math.round(q * 1e6 * (scaleH ? scaleH / H : 1) ** 2) };
+    const rs = await Promise.all(sets.map(s => trial(video, s.win, s.refs, c, kind, q, scaleH, fps)));   // windows in parallel
+    rs.forEach((r, k) => { bytes += r.bytes; secs += sets[k].secs; all.push(...r.scores); });
     all.sort((x, y) => x - y);
     const row = { q, scaleH: scaleH || H, bytesPerSec: bytes / secs, mean: all.reduce((s, x) => s + x, 0) / all.length, p5: all[Math.floor(all.length * 0.05)] };
     table.push(row); onProgress?.(row); return row;
@@ -147,9 +157,30 @@ export async function smartSize(video, keep, kind, target, { allowDownscale = fa
     if (!lastPass) lastPass = table.filter(r => (r.scaleH === (fam || H))).sort((x, y) => y.mean - x.mean)[0];
     if (!best || lastPass.bytesPerSec < best.bytesPerSec && pass(lastPass)) best = lastPass;
   }
-  for (const s of sets) s.frames.forEach(f => f.close());
   if (target === "smart") best = knee(table.filter(pass)) || best;
-  return { ...best, mode: cfg.mode, codec: cfg.codec, hw: cfg.hw, table };
+  // shrinkvid never publishes something bigger than it needs: if the ladder cannot beat the source's own bitrate,
+  // try bitrate targets below the source (VBR) and keep the smallest that still passes the quality floor
+  // shrinkvid never publishes something bigger than it needs. Browser encoders are real-time tuned and can need more
+  // bits than a careful x264 source: then try bitrate targets around the source rate (VBR, 6 s warm-up so rate
+  // control settles) and never go above the source's own bitrate.
+  const srcBps = video.samples.reduce((s, x) => s + x.data.byteLength, 0) / (video.samples.length / fps);
+  if (!best || best.bytesPerSec > srcBps * 0.95) {
+    const vcfg = await encoderConfig(kind, W, H, fps, "variable");
+    const vrows = [];
+    if (vcfg) for (const f of [1.0, 0.8, 0.6]) {
+      let bytes = 0, secs = 0; const all = [];
+      const rs = await Promise.all(sets.map(s => trial(video, s.win, s.refs, { ...vcfg, bitrate: Math.round(srcBps * 8 * f) }, kind, null, 0, fps, 6)));
+      rs.forEach((r, k) => { bytes += r.bytes; secs += sets[k].secs; all.push(...r.scores); });
+      all.sort((x, y) => x - y);
+      const row = { q: `${Math.round(srcBps * 8 * f / 1000)}k`, vbr: Math.round(srcBps * 8 * f), scaleH: H, bytesPerSec: bytes / secs, mean: all.reduce((s, x) => s + x, 0) / all.length, p5: all[Math.floor(all.length * 0.05)] };
+      table.push(row); onProgress?.(row); vrows.push(row);
+      if (!pass(row)) break;
+    }
+    const ok = vrows.filter(pass).sort((a, b) => a.bytesPerSec - b.bytesPerSec)[0];
+    if (ok) best = ok;
+    else if (vrows.length) best = { ...vrows[0], belowFloor: true };   // nothing smaller meets the floor: keep the source's rate
+  }
+  return { ...best, mode: best.vbr ? "variable" : cfg.mode, codec: cfg.codec, hw: cfg.hw, table, srcBps };
 }
 
 // shrinkvid Smart mode: normalised (size, quality) frontier, the point farthest from the chord between its ends
@@ -168,9 +199,10 @@ function knee(rows) {
 export async function render(video, audioOut, keep, choice, { fps, onProgress, audioKbps = 64 }) {
   const kind = choice.kind, W0 = video.track.video.width, H0 = video.track.video.height;
   const H = choice.scaleH && choice.scaleH < H0 ? choice.scaleH : H0, W = H === H0 ? W0 : Math.round(W0 * H / H0 / 2) * 2;
-  const cfg = await encoderConfig(kind, W, H, fps);
+  const cfg = await encoderConfig(kind, W, H, fps, choice.vbr ? "variable" : null);
   if (!cfg) throw new Error(`${CODECS[kind].label} encoding is not supported at ${W}x${H}`);
-  if (cfg.mode === "variable") cfg.bitrate = Math.round(choice.q * 1e6 * (H / H0) ** 2);   // search ladder was in Mbit/s
+  if (choice.vbr) cfg.bitrate = choice.vbr;                                                       // source-relative VBR pick
+  else if (cfg.mode === "variable") cfg.bitrate = Math.round(choice.q * 1e6 * (H / H0) ** 2);   // search ladder was in Mbit/s
   const ach = audioOut.channels.length;
   let acodec = null;
   for (const c of [{ codec: "opus", mux: "opus" }, { codec: "mp4a.40.2", mux: "aac" }]) {
@@ -194,32 +226,41 @@ export async function render(video, audioOut, keep, choice, { fps, onProgress, a
     await aenc.flush(); aenc.close();
   }
 
-  // video: decode everything in order, keep frames by error diffusion against the kept audio time (jumpcutter)
-  const enc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { throw e; } });
-  enc.configure({ ...cfg, width: W, height: H });
-  const cv = H !== H0 ? new OffscreenCanvas(W, H).getContext("2d") : null;
-  const fdur = 1 / fps, gop = Math.round(fps * 10);   // 10 s GOP: lectures are mostly static
+  // video: which source frames to keep (error diffusion against the kept audio time, as jumpcutter), decided up
+  // front so the timeline can be split into segments that encode in parallel (one encoder per CPU core pair; each
+  // segment starts with a keyframe). A GPU encoder is used whenever the browser offers one.
+  const fdur = 1 / fps, gop = Math.round(fps * 10);
   const keptUntil = t => { let s = 0; for (const [a, b] of keep) { if (t <= a) break; s += Math.min(t, b) - a; } return s; };
-  let out = 0, seen = 0; const total = video.samples.length;
-  const pending = [];
-  const dec = await decoderFor(video, f => pending.push(f));
-  const drain = async () => {
-    pending.sort((a, b) => a.timestamp - b.timestamp);
-    while (pending.length > 4 || (pending.length && drain.final)) {
-      const f = pending.shift(), t = f.timestamp / 1e6; seen++;
-      if ((out + 1) * fdur <= keptUntil(t + fdur) + fdur / 2) {
-        let src = cv ? (cv.drawImage(f, 0, 0, W, H), new VideoFrame(cv.canvas, { timestamp: Math.round(out * 1e6 * fdur), duration: Math.round(1e6 * fdur) }))
-                     : new VideoFrame(f, { timestamp: Math.round(out * 1e6 * fdur), duration: Math.round(1e6 * fdur) });
-        enc.encode(src, { keyFrame: out % gop === 0, ...encOpts(kind, cfg.mode === "quantizer" ? choice.q : null) }); src.close(); out++;
-        while (enc.encodeQueueSize > 8) await sleep(1);
+  const order = video.samples.map((x, i) => [x.cts / x.ts, i]).sort((p, q) => p[0] - q[0]);
+  const kept = []; let out = 0;   // [source time, output index]
+  for (const [t] of order) if ((out + 1) * fdur <= keptUntil(t + fdur) + fdur / 2) kept.push([t, out++]);
+  const nseg = globalThis.CLEARCUT_SEGS || Math.max(1, Math.min(cfg.hw ? 2 : 3, Math.floor((navigator.hardwareConcurrency || 4) / 4) || 1,   // measured: 2-4 best, 8 slower
+     Math.floor(kept.length / (gop * 2)) || 1));
+  const segs = []; for (let k = 0; k < nseg; k++) segs.push(kept.slice(Math.floor(k * kept.length / nseg), Math.floor((k + 1) * kept.length / nseg)));
+  let doneFrames = 0;
+  const encodeSegment = async seg => {
+    const chunks = [], want = new Map(seg.map(([t, o]) => [Math.round(t * 1e6), o]));
+    const enc = new VideoEncoder({ output: (c, m) => chunks.push([c, m]), error: e => console.error("encoder", e) });
+    enc.configure({ ...cfg, width: W, height: H });
+    const cv = H !== H0 ? new OffscreenCanvas(W, H).getContext("2d") : null;
+    let first = true;
+    const t0 = seg[0][0], t1 = seg.at(-1)[0] + fdur / 2;
+    await decodeRange(video, t0 - 1e-6, t1, f => {     // streamed: each decoded frame is encoded (or dropped) at once
+      const o = want.get(f.timestamp) ?? want.get(f.timestamp + 1) ?? want.get(f.timestamp - 1);
+      if (o != null) {
+        const src = cv ? (cv.drawImage(f, 0, 0, W, H), new VideoFrame(cv.canvas, { timestamp: Math.round(o * 1e6 * fdur), duration: Math.round(1e6 * fdur) }))
+                       : new VideoFrame(f, { timestamp: Math.round(o * 1e6 * fdur), duration: Math.round(1e6 * fdur) });
+        enc.encode(src, { keyFrame: first || (o - seg[0][1]) % gop === 0, ...encOpts(kind, cfg.mode === "quantizer" && !choice.vbr ? choice.q : null) });
+        src.close(); first = false; doneFrames++;
+        if (doneFrames % 30 === 0) onProgress?.(doneFrames / kept.length);
       }
       f.close();
-      if (seen % 30 === 0) onProgress?.(seen / total);
-    }
+    }, () => enc.encodeQueueSize > 6);
+    await enc.flush(); enc.close();
+    return chunks;
   };
-  for (const s of video.samples) { dec.decode(chunkOf(s)); while (dec.decodeQueueSize > 8) await sleep(1); await drain(); }
-  await dec.flush(); drain.final = true; await drain(); dec.close();
-  await enc.flush(); enc.close();
+  const results = await Promise.all(segs.map(encodeSegment));
+  for (const chunks of results) for (const [c, m] of chunks) muxer.addVideoChunk(c, m);
   muxer.finalize();
-  return { blob: new Blob([muxer.target.buffer], { type: "video/mp4" }), frames: out, codec: cfg.codec, hw: cfg.hw, audio: acodec?.mux, width: W, height: H };
+  return { blob: new Blob([muxer.target.buffer], { type: "video/mp4" }), frames: out, segments: nseg, codec: cfg.codec, hw: cfg.hw, audio: acodec?.mux, width: W, height: H };
 }

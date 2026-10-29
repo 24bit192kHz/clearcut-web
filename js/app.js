@@ -245,27 +245,37 @@ async function setupCodecs() {
   if (!S.demux) { sel.innerHTML = `<option value="ffmpeg">H.264 with ffmpeg.wasm (this format: slow, single-threaded)</option>`; return; }
   const t = S.demux.video.track, have = await availableCodecs(t.video.width, t.video.height, S.fps);
   const order = ["av1", "hevc", "avc"].filter(k => have[k]);
-  sel.innerHTML = order.map(k => `<option value="${k}">${CODECS[k].label}${have[k].hw ? " · hardware" : " · software"}${k === "avc" ? " · plays everywhere" : k === "av1" ? " · smallest" : ""}</option>`).join("") +
+  S.have = have;
+  sel.innerHTML = (order.length > 1 ? `<option value="auto">Auto: the smallest file (tries ${order.map(k => CODECS[k].label).join(", ")})</option>` : "") +
+    order.map(k => `<option value="${k}">${CODECS[k].label} · ${have[k].hw ? "GPU" : "CPU"}${k === "avc" ? " · plays everywhere" : ""}</option>`).join("") +
     `<option value="ffmpeg">H.264 with ffmpeg.wasm (slow)</option>`;
-  const pref = order.find(k => have[k].hw && k !== "hevc") || order[0];
-  if (pref) sel.value = pref;
+  sel.value = order.length > 1 ? "auto" : order[0] || "ffmpeg";
+  const gpu = order.filter(k => have[k].hw).map(k => CODECS[k].label);
+  $("#gpu").innerHTML = gpu.length ? `⚡ Your GPU encodes ${gpu.join(", ")} here.`
+    : `This browser offers no GPU video encoder on this computer (on Linux with an NVIDIA card, browsers can only <i>decode</i> on the GPU), so encoding runs on the CPU, ${Math.min(3, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 4)))} encoders in parallel. Chrome/Edge/Brave on Windows or macOS, or Linux with an Intel/AMD GPU, use the GPU automatically.`;
 }
 $("#codec").addEventListener("change", () => { S.choice = null; $("#searchTable").classList.add("hidden"); });
 $("#quality").addEventListener("change", () => { S.choice = null; });
 $("#downscale").addEventListener("change", () => { S.choice = null; });
 
 async function search() {
-  const kind = $("#codec").value;
-  if (kind === "ffmpeg" || !S.demux) { log("Smart size needs an MP4/MOV source and a WebCodecs encoder; ffmpeg.wasm uses CRF 26."); return null; }
+  const pickKind = $("#codec").value;
+  if (pickKind === "ffmpeg" || !S.demux) { log("Smart size needs a WebCodecs encoder; ffmpeg.wasm uses CRF 26."); return null; }
+  const kinds = pickKind === "auto" ? ["av1", "hevc", "avc"].filter(k => S.have?.[k]) : [pickKind];
   const target = QUALITY[$("#quality").value], tb = $("#searchTable"), kept = S.keep.reduce((s, [a, b]) => s + b - a, 0);
-  tb.classList.remove("hidden"); tb.innerHTML = `<tr><th>setting</th><th>height</th><th>SSIM mean</th><th>p5</th><th>est. video size</th></tr>`;
-  prog("Encoding samples at several settings and comparing them with the original…", 0.1);
-  const res = await smartSize(S.demux.video, S.keep, kind, target, { allowDownscale: $("#downscale").checked, fps: S.fps,
-    onProgress: r => { tb.insertAdjacentHTML("beforeend", `<tr data-q="${r.q}" data-h="${r.scaleH}"><td>${r.q}</td><td>${r.scaleH}p</td><td>${r.mean.toFixed(4)}</td><td>${r.p5.toFixed(4)}</td><td>${mb(r.bytesPerSec * kept)}</td></tr>`); } });
+  tb.classList.remove("hidden"); tb.innerHTML = `<tr><th>codec</th><th>setting</th><th>height</th><th>SSIM mean</th><th>p5</th><th>est. video size</th></tr>`;
+  let res = null;
+  for (const kind of kinds) {
+    prog(`Encoding samples with ${CODECS[kind].label} at several settings and comparing them with the original…`, 0.1);
+    const r = await smartSize(S.demux.video, S.keep, kind, target, { allowDownscale: $("#downscale").checked, fps: S.fps,
+      onProgress: x => { tb.insertAdjacentHTML("beforeend", `<tr data-k="${kind}" data-q="${x.q}" data-h="${x.scaleH}"><td>${CODECS[kind].label}</td><td>${x.q}</td><td>${x.scaleH}p</td><td>${x.mean.toFixed(4)}</td><td>${x.p5.toFixed(4)}</td><td>${mb(x.bytesPerSec * kept)}</td></tr>`); } });
+    r.kind = kind;
+    if (!res || (r.belowFloor === res.belowFloor ? r.bytesPerSec < res.bytesPerSec : !r.belowFloor)) res = r;
+  }
   prog("", null);
-  for (const tr of tb.querySelectorAll("tr[data-q]")) tr.classList.toggle("pick", +tr.dataset.q === res.q && +tr.dataset.h === res.scaleH);
-  tb.insertAdjacentHTML("beforeend", `<tr><td colspan="5" style="text-align:left">Picked ${res.mode === "quantizer" ? "quantizer" : "Mbit/s"} ${res.q} at ${res.scaleH}p (${res.hw ? "hardware" : "software"} ${res.codec}).</td></tr>`);
-  S.choice = { kind, q: res.q, scaleH: res.scaleH };
+  for (const tr of tb.querySelectorAll("tr[data-q]")) tr.classList.toggle("pick", tr.dataset.k === res.kind && tr.dataset.q === String(res.q) && +tr.dataset.h === res.scaleH);
+  tb.insertAdjacentHTML("beforeend", `<tr><td colspan="6" style="text-align:left">Picked ${CODECS[res.kind].label}, ${res.vbr ? "bitrate" : res.mode === "quantizer" ? "quantizer" : "Mbit/s"} ${res.q} at ${res.scaleH}p (${res.hw ? "GPU" : "CPU"}), about ${mb(res.bytesPerSec * kept)} of video.${res.belowFloor ? " The source is already very efficiently encoded: nothing smaller reached the quality target, so its own bitrate is kept and the file only shrinks by the cut time." : ""}</td></tr>`);
+  S.choice = { kind: res.kind, q: res.q, scaleH: res.scaleH, vbr: res.vbr, from: pickKind };
   return S.choice;
 }
 $("#search").onclick = () => search().catch(e => { prog("", null); log("Size search failed: " + e.message); });
@@ -280,7 +290,7 @@ $("#encode").onclick = async () => {
       blob = await renderWithFfmpeg(S.file, S.keep, { crf: 26, audioKbps: akbps, mono }, log, p => prog("Encoding with ffmpeg.wasm…", p));
       info = "H.264 · ffmpeg.wasm";
     } else {
-      const choice = S.choice?.kind === kind ? S.choice : await search();
+      const choice = S.choice && (S.choice.from === kind || S.choice.kind === kind) ? S.choice : await search();
       prog("Cutting the audio…", 0.01);
       const a = spliceAudio(S.audio, S.keep, { mono });
       if ($("#norm").checked) { const n = normalize(a); log(`loudness ${n.loudness.toFixed(1)} LUFS → gain ${n.gainDb.toFixed(1)} dB`); }
