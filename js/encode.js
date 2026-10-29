@@ -35,15 +35,22 @@ export async function availableCodecs(w, h, fps) {
 const encOpts = (kind, q) => q == null ? {} : ({ av1: { av1: { quantizer: q } }, hevc: { hevc: { quantizer: q } }, avc: { avc: { quantizer: q } } })[kind];
 
 // ---------------------------------------------------------------- source decoding
+// GPU decoders can fail mid-stream (seen: VA-API on NVIDIA in Brave). After the first failure every decoder of the
+// session is software. Test hook: globalThis.CLEARCUT_FAIL_HW = frames after which a "hardware" decoder dies.
+let softwareOnly = false;
 async function decoderFor(video, onFrame) {
   const t = video.track, base = { codec: t.codec, codedWidth: t.video.width, codedHeight: t.video.height, description: video.description };
   let cfg = null;
-  for (const hw of ["prefer-hardware", "no-preference", "prefer-software"]) {
+  for (const hw of softwareOnly ? ["prefer-software", "no-preference"] : ["prefer-hardware", "no-preference", "prefer-software"]) {
     try { const r = await VideoDecoder.isConfigSupported({ ...base, hardwareAcceleration: hw }); if (r.supported) { cfg = r.config; break; } } catch { }
   }
   if (!cfg) throw new Error(`this browser cannot decode ${t.codec}`);
-  const dec = new VideoDecoder({ output: onFrame, error: e => console.error("decoder", e) });
+  let failAfter = !softwareOnly && globalThis.CLEARCUT_FAIL_HW ? globalThis.CLEARCUT_FAIL_HW : 0;
+  const dec = new VideoDecoder({
+    output: f => { onFrame(f); if (failAfter && --failAfter === 0) queueMicrotask(() => { dec.error = new Error("simulated GPU decoder failure"); try { dec.close(); } catch { } }); },
+    error: e => { dec.error = e; console.warn("video decoder failed:", e.message || e); } });
   dec.configure(cfg);
+  dec.software = cfg.hardwareAcceleration === "prefer-software" || softwareOnly;
   return dec;
 }
 const chunkOf = s => new EncodedVideoChunk({ type: s.key ? "key" : "delta", timestamp: Math.round(s.cts * 1e6 / s.ts), duration: Math.round(s.duration * 1e6 / s.ts), data: s.data });
@@ -54,11 +61,26 @@ async function decodeRange(video, a, b, onFrame, busy = () => false) {
   const S = video.samples;
   let k = S.findIndex(s => s.cts / s.ts >= a); if (k < 0) return 0;
   while (k > 0 && !S[k].key) k--;
-  let n = 0;
-  const dec = await decoderFor(video, f => { const t = f.timestamp / 1e6; if (t >= a && t < b) { n++; onFrame(f); } else f.close(); });
-  for (let i = k; i < S.length && S[i].dts / S[i].ts < b + 1; i++) { dec.decode(chunkOf(S[i])); while (dec.decodeQueueSize > 4 || busy()) await sleep(1); }
-  await dec.flush(); dec.close();
-  return n;
+  let delivered = 0;                     // frames already handed out: a retry skips them (no duplicates)
+  for (let attempt = 0; ; attempt++) {
+    let n = 0;
+    const dec = await decoderFor(video, f => { const t = f.timestamp / 1e6; if (t >= a && t < b && n++ >= delivered) { delivered++; onFrame(f); } else f.close(); });
+    try {
+      for (let i = k; i < S.length && S[i].dts / S[i].ts < b + 1; i++) {
+        if (dec.state === "closed") throw dec.error || new Error("decoder closed");
+        dec.decode(chunkOf(S[i]));
+        while ((dec.decodeQueueSize > 4 || busy()) && dec.state !== "closed") await sleep(1);
+      }
+      if (dec.state === "closed") throw dec.error || new Error("decoder closed");
+      await dec.flush(); dec.close();
+      return delivered;
+    } catch (e) {
+      try { dec.close(); } catch { }
+      if (dec.software || attempt >= 1) throw e;
+      softwareOnly = true;               // GPU decoder died: software from now on, redo this range
+      console.warn("GPU video decoder failed, continuing with the software decoder:", e.message || e);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- SSIM on luma at 480 px width
@@ -107,8 +129,8 @@ async function trial(video, win, refs, cfg, kind, q, scaleH, fps, warm = 0) {
   const bytes = (warm ? scored.reduce((s, c) => s + c.byteLength, 0) : chunks.slice(1).reduce((s, c) => s + c.byteLength, 0) + key * Math.min(1, secs / 10));
   const scores = [], cache = {};
   const dec = new VideoDecoder({ output: f => { const j = Math.round(f.timestamp * fps / 1e6) - skip; if (j >= 0 && refs[j]) scores.push(ssim(refs[j], lumaOf(f, cache))); f.close(); }, error: e => console.error("decoder", e) });
-  dec.configure(meta);
-  for (const c of chunks) { dec.decode(c); while (dec.decodeQueueSize > 4) await sleep(1); }
+  dec.configure({ ...meta, hardwareAcceleration: "prefer-software" });
+  for (const c of chunks) { if (dec.state === "closed") break; dec.decode(c); while (dec.decodeQueueSize > 4) await sleep(1); }
   await dec.flush(); dec.close();
   return { bytes, scores };
 }

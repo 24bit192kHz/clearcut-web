@@ -12,3 +12,4 @@ test/segbench.mjs
 test/gpuprobe.mjs
 test/playtest.mjs
 test/tldebug.mjs
+test/nofail.mjs

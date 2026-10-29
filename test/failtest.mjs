@@ -1,0 +1,16 @@
+const { chromium } = await import(process.env.PLAYWRIGHT);
+const b = await chromium.launch({ executablePath: process.env.BROWSER, headless: true });
+const p = await b.newPage(); const warn = [];
+p.on("console", m => { if (/decoder failed|GPU/.test(m.text())) warn.push(m.text()); });
+p.on("pageerror", e => console.log("ERR", e.message));
+await p.goto(process.env.URL || "http://127.0.0.1:8791/");
+await p.setInputFiles("#file", process.argv[2]);
+await p.waitForFunction(() => window.clearcut?.A && window.clearcut.demux && document.querySelector("#codec option"), null, { timeout: 600000, polling: 500 });
+await p.evaluate(() => { globalThis.CLEARCUT_FAIL_HW = 20; });
+await p.click("#encode");
+await p.waitForFunction(() => !document.querySelector("#result").classList.contains("hidden") || /failed/i.test(document.querySelector("#log").textContent), null, { timeout: 1800000, polling: 2000 });
+console.log("result:", (await p.innerText("#result").catch(() => "")).split("\n").slice(0,2).join(" / "), "| log:", (await p.innerText("#log").catch(() => "")).slice(0, 300));
+console.log("fallback messages:", warn.length, warn[0] || "");
+const frames = await p.evaluate(async () => { const a = document.querySelector("#result a"); if (!a) return null; const buf = await (await fetch(a.href)).arrayBuffer(); return buf.byteLength; });
+console.log("output bytes:", frames);
+await b.close();
