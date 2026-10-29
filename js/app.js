@@ -249,7 +249,11 @@ matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { d
 addEventListener("keydown", e => {
   if (!S.peaks || ["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
   const t = video.currentTime;
-  if (e.key === " ") { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+  if (e.key === " ") {
+    if (e.target === video) return;                 // the player's own controls handle Space (else it toggles twice)
+    e.preventDefault(); if (e.target.tagName === "BUTTON") e.target.blur();   // a focused button must not be "clicked" too
+    video.paused ? video.play() : video.pause();
+  }
   else if (e.key === "ArrowRight") { e.preventDefault(); const c = S.cuts.find(c => c.start > t + 0.05); if (c) seek(c.start - 1); }
   else if (e.key === "ArrowLeft") { e.preventDefault(); const c = [...S.cuts].reverse().find(c => c.start < t - 1.1); if (c) seek(c.start - 1); }
   else if (e.key.toLowerCase() === "x") { const c = S.cuts.find(c => t >= c.start - 0.05 && t <= c.end + 0.05); if (c) { c.enabled = !c.enabled; update(); } }
