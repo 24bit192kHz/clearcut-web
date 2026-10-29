@@ -1,0 +1,10 @@
+test/*.mp4
+test/*.webm
+test/*.mkv
+test/*.json
+test/*.png
+test/*.fc
+test/*.txt
+node_modules/
+test/calib.mjs
+test/run.sh

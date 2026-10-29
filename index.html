@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clearcut — cut pauses, fillers and size in your browser</title>
+<meta name="description" content="Remove silences, uh/aaa fillers, stretched sounds and breaths from a video, preview every cut before encoding, then encode at the smallest size that keeps the quality. Runs entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23161b22'/><path d='M6 16h5M21 16h5' stroke='%2358a6ff' stroke-width='3' stroke-linecap='round'/><path d='M13 9l6 14M19 9l-6 14' stroke='%23f85149' stroke-width='3' stroke-linecap='round'/></svg>">
+<style>
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950;--bad:#f85149;--warn:#d29922;
+  --c-pause:#8b949e;--c-filler:#f85149;--c-stretch:#d29922;--c-breath:#58a6ff;--c-manual:#a371f7}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--line:#d0d7de;--fg:#1f2328;--mut:#59636e;--acc:#0969da;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;
+  --c-pause:#6e7781;--c-filler:#cf222e;--c-stretch:#9a6700;--c-breath:#0969da;--c-manual:#8250df}}
+:root[data-theme="light"]{--bg:#ffffff;--bg2:#f6f8fa;--bg3:#eaeef2;--line:#d0d7de;--fg:#1f2328;--mut:#59636e;--acc:#0969da;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;
+  --c-pause:#6e7781;--c-filler:#cf222e;--c-stretch:#9a6700;--c-breath:#0969da;--c-manual:#8250df}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1200px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:0}h2{font-size:16px;margin:0 0 8px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+header p{margin:0;color:var(--mut);font-size:14px}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+#drop{display:block;border:2px dashed var(--line);border-radius:12px;padding:40px 16px;text-align:center;cursor:pointer;color:var(--mut)}
+#drop.over{border-color:var(--acc);color:var(--fg)}
+#drop b{color:var(--fg);font-size:17px}
+#drop.small{padding:8px 12px;text-align:left}#drop.small br,#drop.small span{display:none}
+button,select,input[type=number]{font:inherit;color:var(--fg);background:var(--bg3);border:1px solid var(--line);border-radius:7px;padding:5px 10px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+input[type=number]{width:80px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:12px}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+video{width:100%;max-height:52vh;background:#000;border-radius:8px;display:block}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:transparent}.seg button.on{background:var(--acc);color:#fff}
+.stats{display:flex;gap:16px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.stats div{min-width:110px}.stats b{display:block;font-size:20px}
+.stats span{color:var(--mut);font-size:13px}
+#tlwrap{position:relative;user-select:none}
+#tl{width:100%;height:150px;display:block;border-radius:8px;background:var(--bg);cursor:pointer;touch-action:none}
+#mini{width:100%;height:26px;display:block;border-radius:6px;background:var(--bg);margin-bottom:6px;cursor:pointer}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mut);margin-top:6px}
+.sw{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 10px;padding:8px 10px}
+legend{padding:0 4px;font-weight:600}
+fieldset label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0;font-size:14px}
+fieldset label.chk{justify-content:flex-start}
+.hint{color:var(--mut);font-size:12.5px;margin:2px 0 4px}
+#list{max-height:340px;overflow:auto;font-size:13.5px;font-variant-numeric:tabular-nums}
+#list table{width:100%;border-collapse:collapse}
+#list td,#list th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+#list tr.off td{opacity:.45;text-decoration:line-through}
+#list tr.cur td{background:var(--bg3)}
+.pill{display:inline-block;padding:0 7px;border-radius:9px;font-size:12px;color:#fff}
+.bar{height:8px;background:var(--bg3);border-radius:4px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);width:0}
+#log{font:12px/1.4 ui-monospace,monospace;color:var(--mut);max-height:120px;overflow:auto;white-space:pre-wrap}
+#searchTable td,#searchTable th{padding:2px 8px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
+#searchTable tr.pick td{color:var(--ok);font-weight:600}
+.hidden{display:none!important}
+a{color:var(--acc)}
+kbd{border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 4px;font-size:12px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>✂ clearcut</h1>
+  <p>Cut pauses, “uh/aaa”, stretched sounds and breaths, check every cut, then encode at the smallest size that still looks right. Nothing is uploaded: it all runs in this tab.</p>
+</header>
+
+<label id="drop" class="card"><input id="file" type="file" accept="video/*,audio/*,.mkv,.mov,.avi,.ts,.flv,.wmv" hidden>
+  <b>Drop a video here or click to choose</b><br><span>Any format: MP4/MOV are cut with your graphics chip (WebCodecs); MKV, AVI, WebM, TS and others go through ffmpeg.wasm.</span></label>
+
+<section id="work" class="hidden">
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="stats" id="stats"></div>
+      <div class="row">
+        <span class="seg" id="mode" title="What the player plays">
+          <button data-m="skip" class="on" title="Plays the result: removed parts are skipped">Preview result</button>
+          <button data-m="orig" title="Plays the untouched original">Original</button>
+          <button data-m="cuts" title="Plays only what will be removed">Only the cuts</button>
+        </span>
+      </div>
+    </div>
+    <div id="progress" class="hidden" style="margin-top:10px"><div class="row"><span id="ptext">Analysing…</span></div><div class="bar"><i id="pbar"></i></div></div>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card"><video id="video" controls playsinline></video></div>
+      <div class="card">
+        <canvas id="mini" title="Whole video: click to jump"></canvas>
+        <div id="tlwrap"><canvas id="tl"></canvas></div>
+        <div class="legend" id="legend"></div>
+        <p class="hint">Click a coloured block to keep/remove it · drag on the waveform to add your own cut · scroll to zoom, shift+scroll or drag the top strip to move · <kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> previous/next cut · <kbd>X</kbd> toggle the cut under the playhead</p>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between"><h2>Cuts</h2>
+          <div class="row"><select id="filter"><option value="">all types</option></select>
+          <button id="allOn">remove all shown</button><button id="allOff">keep all shown</button></div></div>
+        <div id="list"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" id="opts">
+        <h2>What to remove</h2>
+        <fieldset><legend><label class="chk"><input type="checkbox" data-o="pauses"> Pauses (silence)</label></legend>
+          <label>Speech detection threshold <input type="number" data-o="vadThreshold" step="0.05" min="0.1" max="0.95"></label>
+          <label class="chk"><input type="checkbox" data-o="strictVad"> Strict (also drops breaths/noise jumpcutter-style)</label>
+          <label>Padding around speech, ms <input type="number" data-o="marginMs" step="5" min="0" max="500"></label>
+          <label>Keep pauses shorter than, ms <input type="number" data-o="minSilenceMs" step="10" min="0" max="2000"></label>
+          <label>Leave this much of each pause, ms <input type="number" data-o="keepSilenceMs" step="10" min="0" max="2000"></label>
+          <p class="hint">Silero VAD, the same model and defaults as clearcut (75 ms padding, 180 ms shortest pause cut).</p>
+        </fieldset>
+        <fieldset><legend>“uh”, “aaa” and stretched sounds</legend>
+          <label class="chk"><input type="checkbox" data-o="fillers"> Remove “uh/aaa” between pauses</label>
+          <label class="chk"><input type="checkbox" data-o="chained"> Shorten “uh/aaa” between words</label>
+          <label class="chk"><input type="checkbox" data-o="stretches"> Shorten stretched sounds (“sooo”, “welll”)</label>
+          <label>How much to leave <select data-o="preset"><option value="tight">tight (70 ms pause, 80 ms filler, 130 ms stretch)</option><option value="gentle">gentle (100 / 120 / 180 ms)</option></select></label>
+          <label>Steadiness (MFCC flux below) <input type="number" data-o="fluxMax" step="0.1" min="1" max="5"></label>
+          <label>Pitch steadiness, semitones <input type="number" data-o="pitchMax" step="0.1" min="0.5" max="4"></label>
+          <label>Shortest sound, ms <input type="number" data-o="minRunMs" step="10" min="100" max="1000"></label>
+          <p class="hint">clearcut’s detector: a held “aaa” has a flat spectrum and a flat pitch. Higher steadiness or pitch values find more (and risk real words).</p>
+        </fieldset>
+        <fieldset><legend><label class="chk"><input type="checkbox" data-o="breaths"> Breaths</label></legend>
+          <label>Length, ms <span><input type="number" data-o="breathMinMs" step="10" min="50" max="2000"> – <input type="number" data-o="breathMaxMs" step="10" min="100" max="3000"></span></label>
+          <p class="hint">Unvoiced noisy bursts next to a pause.</p>
+        </fieldset>
+      </div>
+
+      <div class="card" id="out">
+        <h2>Encode</h2>
+        <fieldset><legend>Size (shrinkvid)</legend>
+          <label>Codec <select id="codec"></select></label>
+          <label>Quality target <select id="quality"><option value="smart" selected>smart: knee of size vs quality (like shrinkvid)</option><option value="high">high (≈ VMAF 97)</option><option value="balanced">balanced (≈ VMAF 96)</option><option value="small">small (≈ VMAF 94)</option></select></label>
+          <label class="chk"><input type="checkbox" id="downscale"> Allow a lower resolution if it is smaller at the same quality</label>
+          <p class="hint">Encodes three short samples at several settings, checks each against the original, and picks the smallest that meets the target.</p>
+          <button id="search">Find the best size</button>
+          <table id="searchTable" class="hidden"></table>
+        </fieldset>
+        <fieldset><legend>Audio</legend>
+          <label class="chk"><input type="checkbox" id="mono" checked> Mono (speech)</label>
+          <label>Bitrate, kbit/s <input type="number" id="akbps" value="64" min="16" max="320" step="8"></label>
+          <label class="chk"><input type="checkbox" id="norm"> Even out loudness (−16 LUFS, peaks −2 dB)</label>
+        </fieldset>
+        <div class="row"><button class="primary" id="encode">Encode</button><button id="savePlan">Save cut list</button><label><button id="loadPlanBtn" type="button">Load cut list</button><input type="file" id="loadPlan" accept=".json" hidden></label></div>
+        <div id="result" class="hidden" style="margin-top:10px"></div>
+        <div id="log" class="hidden" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+</section>
+<p class="hint" style="text-align:center">clearcut in the browser · Silero VAD (MIT) · ONNX Runtime Web · mp4box.js · mp4-muxer · ffmpeg.wasm · <a href="https://github.com/">source</a></p>
+</main>
+<script src="vendor/mp4box.all.min.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
